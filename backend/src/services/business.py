@@ -16,7 +16,7 @@ def metadata():
         "downstream": "周度维保备料协同会；输出预测用于人工判断，不生成采购单。",
         "entities": ["领用日历", "预测试算", "周度分发计划"],
         "dataset_name": "江湾精机_2026Q3_稀疏领用.csv",
-        "columns": [{"key": "day", "label": "领用日", "type": "string"}, {"key": "part", "label": "备件编码", "type": "string"}, {"key": "demand", "label": "领用件数", "type": "number"}],
+        "columns": [{"key": "day", "label": "领用日", "type": "string", "format": "date"}, {"key": "part", "label": "备件编码", "type": "string"}, {"key": "demand", "label": "领用件数", "type": "number"}],
         "parameters": [
             {"key": "part", "label": "备件", "type": "select", "default": "R17", "options": [{"value": "R17", "label": "R17 密封环"}, {"value": "G22", "label": "G22 联轴片"}]},
             {"key": "alpha", "label": "平滑系数 α", "type": "number", "default": 0.2, "min": 0.05, "max": 0.8},
@@ -26,7 +26,7 @@ def metadata():
         "workbench_title": "领用间隔与批量试算", "action_label": "运行领用预测", "unit": "件/天",
         "accent": "oklch(54% 0.12 65)", "style": "parts-ledger",
         "seed_story": ["08:30 上传江湾精机_2026Q3_稀疏领用.csv，共 360 行。", "08:40 校验 R17 与 G22 各 180 天日历，零领用日也保留。", "09:00 选择 R17、α=0.2 和 SBA 校正。", "09:10 运行 14 天预测并查看末 28 天逐日回测。", "09:20 比较原始 Croston 与 SBA 的日均预测差异。", "10:00 将累计领用估计提交维保例会，检查停机检修安排。", "16:00 为维保组设置本地收件箱分发计划，归档参数和结果。"],
-        "method": "Croston 对非零需求量和需求间隔分别指数平滑，SBA 乘以 (1−α/2)。末 28 天做严格向前滚动一步回测。",
+        "method": "Croston 对非零需求量和需求间隔分别指数平滑，SBA 乘以 (1−α/2)。末 28 个已报告日做严格向前滚动一步回测；缺报日不参与计算，日历按已报告自然日序列平滑。",
         "limitations": ["预测是假设未来领用过程稳定时的期望值，不是安全库存或服务水平承诺。", "无采购提前期、库存余额和停机计划输入，不输出补货指令。"],
     }
 
@@ -82,22 +82,38 @@ def analyze(records, params):
     if variant not in ("sba", "croston"):
         raise ValueError("未知的 Croston 变体")
     rows = []
+    missing = 0
+    seen = set()
     for record in records:
         if str(record.get("part")) != part:
             continue
         try:
             day = date.fromisoformat(str(record["day"]))
-            demand = float(record["demand"])
         except (KeyError, TypeError, ValueError):
-            raise ValueError("领用日须为 ISO 日期且 demand 为非负数") from None
+            raise ValueError("领用日须为 ISO 日期") from None
+        if day in seen:
+            raise ValueError(f"领用日历存在重复日期：{day}，请先在数据接入合并去重")
+        seen.add(day)
+        raw = record.get("demand")
+        if raw is None or raw == "":
+            missing += 1  # 缺报日：与明确零领用分开，未补齐前不参与预测
+            continue
+        try:
+            demand = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError("demand 必须为非负数，留空表示缺报") from None
         if not math.isfinite(demand) or not 0 <= demand <= 1_000_000_000:
             raise ValueError("单日领用量必须是0至10亿之间的有限数值")
         rows.append((day, demand))
     rows.sort()
+    cursor = min(seen) if seen else None
+    last = max(seen) if seen else None
+    while cursor is not None and cursor <= last:
+        if cursor not in seen:
+            raise ValueError(f"领用日历在 {cursor} 断档且未标记缺报，请补全零需求日或缺报标记")
+        cursor += timedelta(days=1)
     if len(rows) < 45:
-        raise ValueError("所选备件至少需要 45 个连续自然日")
-    if any((rows[i][0] - rows[i - 1][0]).days != 1 for i in range(1, len(rows))):
-        raise ValueError("领用日历有重复或缺失日期，请补全零需求日")
+        raise ValueError("所选备件已报告天数不足 45 个连续自然日（缺报日不参与试算），请先补齐缺报")
     values = [item[1] for item in rows]
     fitted = []
     baseline = []
@@ -113,13 +129,18 @@ def analyze(records, params):
         raise ValueError("预测末日超出日历支持范围，请检查最后观测日期")
     future = [{"day": str(rows[-1][0] + timedelta(days=i)), "expected": round(rate, 4), "cumulative": round(rate * i, 3)} for i in range(1, horizon + 1)]
     warnings = []
+    if missing:
+        warnings.append(f"有 {missing} 个缺报日未参与试算，日历按已报告自然日连续计算；补齐后请生成新批次重新计算。")
     if nonzero_count < 5:
         warnings.append("非零领用日少于 5 个，预测对单次领用非常敏感。")
     if mae > baseline_mae:
         warnings.append("本次末 28 天回测 MAE 高于历史均值基线，应保留人工复核。")
+    metrics = [{"label": "平滑领用率", "value": round(rate, 4), "unit": "件/天"}, {"label": "预测期累计", "value": round(rate * horizon, 2), "unit": "件"}, {"label": "末28天 MAE", "value": round(mae, 4), "unit": "件"}, {"label": "非零日占比", "value": round(nonzero_count / len(values) * 100, 2), "unit": "%"}]
+    if missing:
+        metrics.append({"label": "缺报日（未参与）", "value": missing, "unit": "天"})
     return {
-        "summary": f"{part} 在 {len(rows)} 天中有 {nonzero_count} 个领用日；{variant.upper()} 预计未来 {horizon} 天领用 {rate * horizon:.2f} 件。",
-        "metrics": [{"label": "平滑领用率", "value": round(rate, 4), "unit": "件/天"}, {"label": "预测期累计", "value": round(rate * horizon, 2), "unit": "件"}, {"label": "末28天 MAE", "value": round(mae, 4), "unit": "件"}, {"label": "非零日占比", "value": round(nonzero_count / len(values) * 100, 2), "unit": "%"}],
+        "summary": f"{part} 在 {len(rows)} 个已报告天中有 {nonzero_count} 个领用日；{variant.upper()} 预计未来 {horizon} 天领用 {rate * horizon:.2f} 件。" + (f"另有 {missing} 个缺报日未参与试算。" if missing else ""),
+        "metrics": metrics,
         "table": {"columns": [{"key": "day", "label": "预测日期"}, {"key": "expected", "label": "当日领用期望"}, {"key": "cumulative", "label": "累计领用期望"}], "rows": future},
         "chart": {"type": "line", "labels": [str(row[0]) for row in rows[-28:]], "series": [{"name": "真实领用", "values": actual}, {"name": "滚动一步预测", "values": [round(value, 4) for value in fitted]}]},
         "findings": [f"历史均值基线 MAE={baseline_mae:.4f}；本次模型 MAE={mae:.4f}，回测每个预测仅使用前一天及更早数据。", f"α={alpha:g}；最后观测日 {rows[-1][0]}；未来 {horizon} 天按同一稳定领用率外推。", "领用期望可以是小数；需要整数备料时应在例会结合检修计划另行决策。"],
